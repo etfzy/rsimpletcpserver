@@ -1,22 +1,29 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Result};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener,TcpStream};
+use byteorder::{ByteOrder, LittleEndian};
+use tokio::io::{AsyncReadExt, BufReader,BufWriter, AsyncWriteExt};
+use tokio::sync::mpsc;
+use std::sync::Arc;
 use std::{io};
 mod tcp_server;
-use tcp_server::{server,proto,connection};
+use tcp_server::{connection,proto,server};
+struct Event {}
 
-fn call(content: Vec<u8>) -> connection::Action {
-    let num = content.len();
-    let s = String::from_utf8(content).unwrap_or(String::from(""));
-    println!("content {:?} {:?}",num,s);
-    return connection::Action::Normal
+impl tcp_server::connection::RServer for  Event {
+    fn react(&self,content: Vec<u8>,client_writer: &mut mpsc::UnboundedSender<Vec<u8>>) -> connection::Action {
+        let a = String::from_utf8(content).map(|op| {println!("{}",op);1});
+        println!("react a {:?}",a);
+        client_writer.send("testdata".to_string().into_bytes());
+
+        connection::Action::Normal
+    }
 }
 
 #[tokio::main]
 async fn main()   {
 
-    let request = proto::tlv::new(100, 4, 4);
-    let response = proto::tlv::new(100, 4, 4);
-    let proto = proto::proto::new(request, response);
-    let s = server::simpleTcpServer::new("0.0.0.0:8020".to_string(),proto,call);
+    let decoder = proto::decoder::new(1001, 4, 4,16*1024,false).unwrap();
+    let event = Event{};
+    let s = server::simpleTcpServer::new("0.0.0.0:8000".to_string(),decoder,event);
     s.run().await;
 }

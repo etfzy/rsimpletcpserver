@@ -1,9 +1,17 @@
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener,TcpStream};
 use byteorder::{ByteOrder, LittleEndian};
-use tokio::io::{AsyncReadExt, BufReader, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, BufReader, BufWriter,AsyncWriteExt};
+use tokio::sync::mpsc;
 use std::sync::Arc;
-use super::proto::{self, tlv};
+use std::rc;
+use super::proto::{self, decoder};
+
+pub trait RServer {
+    fn on_open(&self,stream: &TcpStream,addr: String){}
+    fn on_close(&self,addr: String){}
+    fn react(&self,content: Vec<u8>,client_writer:  &mut mpsc::UnboundedSender<Vec<u8>>) -> Action;
+}
 
 
 pub enum Action {
@@ -11,27 +19,31 @@ pub enum Action {
     Close,
 } 
 
-pub type CallBack = fn(content: Vec<u8>)-> Action;
-
-
-
 
 #[derive(Debug)]
-pub struct connection {
-    proto: proto::proto,
-    call: Arc<CallBack>
+pub struct ConnectionReader{
+    proto: proto::decoder,
+    addr:String,
+    sender:  mpsc::UnboundedSender<Vec<u8>>,
+    buf_reader: BufReader<OwnedReadHalf>,
 }
 
 
-impl connection {
-    pub fn new(proto: proto::proto,call:Arc::<CallBack>) -> connection {
-        return connection {proto:proto,call}
+impl ConnectionReader{
+    pub fn new(proto: proto::decoder,addr:String,writer: mpsc::UnboundedSender<Vec<u8>>,buf_reader:  BufReader<OwnedReadHalf>) -> ConnectionReader {
+        return ConnectionReader {
+            proto:proto,
+            addr:addr,
+            sender:writer,
+            buf_reader:buf_reader,
+        }
     }
-    pub async fn process_content(&self,buf_reader: &mut BufReader<OwnedReadHalf>,content_len: u64) -> Result<Vec<u8>,String> {
+
+    pub async fn process_content(&mut self,content_len: u64) -> Result<Vec<u8>,String> {
         let usize_len = content_len as usize;
         let mut vec_content=vec![0u8;usize_len];
         loop {
-            match buf_reader.read_exact(&mut vec_content).await {
+            match self.buf_reader.read_exact(&mut vec_content).await {
                 Err(e) => {
                     return Err(format!("clent close for error: {}",e));
                 }
@@ -47,10 +59,10 @@ impl connection {
         return Err(String::from("client close"));
     }
     
-    pub async fn process_header(&self,buf_reader: &mut BufReader<OwnedReadHalf>) -> Result<u64,String> {
-        let mut vec_header = vec![0u8;4];
+    pub async fn process_length(&mut self) -> Result<u64,String> {
+        let mut vec_header = vec![0u8;self.proto.len_len as usize];
         loop {
-            match buf_reader.read_exact(&mut vec_header).await {
+            match self.buf_reader.read_exact(&mut vec_header).await {
                 Err(e) => {
                     return Err(format!("clent close for error: {}",e));
                 }
@@ -58,22 +70,26 @@ impl connection {
                     return Err(String::from("client close"));
                 }
                 Ok(n) => {
-                    println!("read buffer length {}",n);
-                    let header = LittleEndian::read_u32(&vec_header);
-                    return Ok(header as u64);
+                    
+                    let length = self.proto.decode_length(vec_header);
+                   
+                    return Ok(length);
                 }
             }
         }
-    
         return Err(String::from("client close"));
-    
     }
     
     
-    pub async fn process_flag(&self,buf_reader: &mut BufReader<OwnedReadHalf>) -> Result<(),String> {
-        let mut vec_header = vec![0u8;4];
+    pub async fn process_flag(&mut self) -> Result<(),String> {
+
+        if self.proto.flag_len == 0 {
+            return Ok(());
+        }
+
+        let mut vec_flag = vec![0u8;self.proto.flag_len as usize];
         loop {
-            match buf_reader.read_exact(&mut vec_header).await {
+            match self.buf_reader.read_exact(&mut vec_flag).await {
                 Err(e) => {
                     return Err(format!("clent close for error: {}",e));
                 }
@@ -81,14 +97,10 @@ impl connection {
                     return Err(String::from("client close"));
                 }
                 Ok(n) => {
-                    println!("read buffer length {}",n);
-                    let flag = LittleEndian::read_u32(&vec_header);
-    
-                    if let 1001 = flag {
-                        println!("flag check ok:{}",flag);
+                    let flag = self.proto.decode_flag(vec_flag);
+                    if flag == self.proto.flag {
                         return Ok(());
                     }
-                    println!("flag check failed:{}",flag);
                     return Err(format!("clent close for flag error: {}",flag));
                 }
             }
@@ -98,56 +110,74 @@ impl connection {
     
     }
     
-  
-    pub fn run (&self,content: Vec<u8>)-> Action {
-        return (*self.call)(content);
-    }
-    pub async fn process_socket(stream: TcpStream,conn: connection) {
- 
-        stream.set_nodelay(true);
-        let (mut client_reader,  mut client_writer) = stream.into_split();
-        
-        let mut buf_reader = tokio::io::BufReader::new(client_reader);
-    
-        let mut count = 0;
+    pub async fn run <T:RServer>(&mut self,rserver:Arc<T>){
         loop {
-            match conn.process_flag(&mut buf_reader).await {
+            match self.process_flag().await {
                 Ok(_) => { 
-                    match conn.process_header(&mut buf_reader).await {
-                        Ok(num) =>{
-                            println!("receive {}",num);
-    
-                            if num > 16*1024 {
-                                println!("receive too lang {}",num);
-                                break; 
+                    match self.process_length().await {
+                        Ok(length) =>{
+                            if length > self.proto.max_size {
+                                println!("receive too lang {}",length);
+                                return;
                             }
     
-                            match conn.process_content(&mut buf_reader,num).await {
+                            match self.process_content(length).await {
                                 Ok(content) => {
-
-                                        conn.run(content);
-
+                                    
+                                    match rserver.react(content,&mut self.sender) {
+                                            Action::Close => {
+                                            return ;
+                                        },
+                                        _ => {}
+                                    }
                                 }
                                 Err(_) => {
-                                    break;
+                                    return;
                                 }
                             }
                         }
                         Err(_)=> {
-                            println!("stop thread for process_header");
-                            break;
+                            return;
                         }
                     }
                 }
                 Err(_)=> {
-                    println!("stop thread for process_flag");
-                    break ;
+                    return;
                 }
             }
-            count = count+1;
-            println!("stop client read{}",count);
-        }    
+
+        }   
+        
     }
 }
 
 
+#[derive(Debug)]
+pub struct ConnectionSender{
+    proto: proto::decoder,
+    addr:String,
+    receiver:  mpsc::UnboundedReceiver<Vec<u8>>,
+    buf_writer: BufWriter<OwnedWriteHalf>
+}
+
+
+
+impl ConnectionSender {
+    pub fn new(proto: proto::decoder,addr:String,receiver: mpsc::UnboundedReceiver<Vec<u8>>,writer: BufWriter<OwnedWriteHalf>) -> ConnectionSender {
+        return ConnectionSender {
+            proto:proto,
+            addr:addr,
+            receiver:receiver,
+            buf_writer:writer,
+        }
+    }
+
+    pub async fn run(&mut self) {
+        while let Some(v) = self.receiver.recv().await {
+            if let Err(e) = self.buf_writer.write_all(&v).await {
+                break;
+            }
+        }
+    }
+
+}
