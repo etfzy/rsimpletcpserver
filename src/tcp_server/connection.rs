@@ -116,8 +116,8 @@ impl ConnectionReader{
                 Ok(_) => { 
                     match self.process_length().await {
                         Ok(length) =>{
-                            if length > self.proto.max_size {
-                                println!("receive too lang {}",length);
+                            if length > self.proto.max_size || length <=0 {
+                                println!("receive msg length error {}",length);
                                 return;
                             }
     
