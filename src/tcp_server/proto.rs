@@ -92,7 +92,7 @@ impl decoder {
                 }
             }
         }else {
-            match self.flag_len {
+            match self.len_len {
                 2 => {
                     result = LittleEndian::read_u16(&data) as u64;
                 }
